@@ -1,0 +1,187 @@
+import os
+import re
+import json
+import datetime
+import openpyxl
+
+# === CONFIGURAÇÕES ===
+CAMINHO_EMPRESAS = r"G:\EMPRESAS"
+CAMINHO_PLANILHA = r"G:\PMA\LISTA EMPRESAS - NETO CONTABILIDADE 2025.xlsm"
+ABA_PLANILHA = "MARIA CLARA"
+TABELA_INICIO = 2
+MODO_TESTE = False  # Modo de teste para limitar o número de empresas
+LIMITE_EMPRESAS = 10 if MODO_TESTE else None
+
+# Diretório do script (para salvar JSON no mesmo local)
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+ARQUIVO_JSON_SAIDA = os.path.join(SCRIPT_DIR, "status_alvaras.json")
+
+MAPEAMENTO_COLUNAS = {
+    "ALVARÁ BOMBEIROS": 11,
+    "ALVARÁ VIG SANITÁRIA": 10,
+    "ALVARÁ FUNCIONAMENTO": 12,
+    "LICENÇA AMBIENTAL": 13,
+    "CERTIDÃO USO DO SOLO": 15
+}
+
+TIPOS_DOCUMENTOS = {
+    "ALVARÁ BOMBEIROS": ["ALVARÁ BOMBEIROS"],
+    "ALVARÁ VIG SANITÁRIA": [
+        "ALVARÁ VIG SANITÁRIA", "ALVARÁ VIG SANITÁRIA PROVISÓRIO",
+        "DISPENSA SANITÁRIA", "DISPENSA AMBIENTAL E SANITÁRIA"
+    ],
+    "ALVARÁ FUNCIONAMENTO": [
+        "ALVARÁ FUNCIONAMENTO DEFINITIVO", "ALVARÁ FUNCIONAMENTO CONDICIONADO",
+        "ALVARÁ FUNCIONAMENTO PROVISÓRIO"
+    ],
+    "LICENÇA AMBIENTAL": [
+        "LICENÇA AMBIENTAL", "DISPENSA AMBIENTAL", "DISPENSA AMBIENTAL E SANITÁRIA"
+    ],
+    "CERTIDÃO USO DO SOLO": ["USO DO SOLO"]
+}
+
+SUFIXOS_IGNORAR = [" - filial", " - matriz", " - sede"]
+
+def limpar_nome_empresa(nome):
+    nome = nome.lower()
+    for sufixo in SUFIXOS_IGNORAR:
+        if sufixo in nome:
+            nome = nome.replace(sufixo, "")
+    return nome.strip().upper()
+
+def criar_padrao(nome_base):
+    return rf"(?i)^{nome_base}\s*-\s*(val\s*)?(\d{{2}})[.-](\d{{2}})[.-](\d{{4}})"
+
+PADROES_ARQUIVOS = {
+    "ALVARÁ BOMBEIROS": criar_padrao("alvar[áa] bombeiros"),
+    "USO DO SOLO": criar_padrao("uso do solo"),
+    "ALVARÁ FUNCIONAMENTO DEFINITIVO": r"(?i)^alvar[áa] funcionamento\s*-\s*definitivo",
+    "ALVARÁ FUNCIONAMENTO PROVISÓRIO": criar_padrao("alvar[áa] funcionamento\s*-\s*provis[óo]rio"),
+    "ALVARÁ FUNCIONAMENTO CONDICIONADO": criar_padrao("alvar[áa] funcionamento\s*-\s*condicionado"),
+    "ALVARÁ VIG SANITÁRIA": criar_padrao("alvar[áa] vig sanit[áa]ria"),
+    "ALVARÁ VIG SANITÁRIA PROVISÓRIO": criar_padrao("alvar[áa] vig sanit[áa]ria\s*-\s*provis[óo]rio"),
+    "LICENÇA AMBIENTAL": criar_padrao("licen[çc]a ambiental"),
+    "DISPENSA SANITÁRIA": criar_padrao("dispensa sanit[áa]ria"),
+    "DISPENSA AMBIENTAL": criar_padrao("dispensa ambiental"),
+    "DISPENSA AMBIENTAL E SANITÁRIA": criar_padrao("dispensa ambiental e sanit[áa]ria")
+}
+
+def carregar_planilha():
+    wb = openpyxl.load_workbook(CAMINHO_PLANILHA, keep_vba=True)
+    ws = wb[ABA_PLANILHA]
+    return wb, ws
+
+def extrair_empresas(ws):
+    empresas = []
+    for i, row in enumerate(ws.iter_rows(min_row=TABELA_INICIO), start=TABELA_INICIO):
+        nome = row[0].value
+        municipio = row[3].value if len(row) > 3 else None
+        if nome and municipio:
+            empresas.append((nome.strip(), municipio.strip(), i))
+            if MODO_TESTE and len(empresas) >= LIMITE_EMPRESAS:
+                break
+    return empresas
+
+def buscar_arquivos_validos(pasta):
+    return [f for f in os.listdir(pasta) if f.lower().endswith((".pdf", ".jpg", ".png", ".jpeg"))]
+
+def extrair_data(nome_arquivo, padrao):
+    match = re.search(padrao, nome_arquivo)
+    if match:
+        try:
+            dia, mes, ano = match.group(2), match.group(3), match.group(4)
+            return datetime.date(int(ano), int(mes), int(dia))
+        except:
+            return None
+    return None
+
+def interpretar_documentos(arquivos):
+    hoje = datetime.date.today()
+    resultado = {tipo: None for tipo in TIPOS_DOCUMENTOS.keys()}
+    documentos_identificados = {doc: [] for doc in PADROES_ARQUIVOS.keys()}
+
+    for arq in arquivos:
+        for doc_tipo, padrao in PADROES_ARQUIVOS.items():
+            if re.search(padrao, arq):
+                data = extrair_data(arq, padrao)
+                documentos_identificados[doc_tipo].append((arq, data))
+                break
+
+    for categoria, tipos in TIPOS_DOCUMENTOS.items():
+        definitivo = next((doc for tipo in tipos if "DEFINITIVO" in tipo for doc in documentos_identificados[tipo]), None)
+        if definitivo:
+            resultado[categoria] = "Definitivo"
+            continue
+
+        dispensa_doc = next(
+            ((doc, data) for tipo in tipos if "DISPENSA" in tipo for (doc, data) in documentos_identificados[tipo]),
+            None
+        )
+        if dispensa_doc and dispensa_doc[1]:
+            resultado[categoria] = f"Dispensa. Val {dispensa_doc[1].strftime('%d/%m/%Y')}"
+            continue
+
+        todos = [(doc, data) for tipo in tipos for (doc, data) in documentos_identificados[tipo] if data]
+        if todos:
+            doc_mais_recente = max(todos, key=lambda x: x[1])
+            status = "Possui" if doc_mais_recente[1] >= hoje else "Vencido"
+            resultado[categoria] = f"{status}. Val {doc_mais_recente[1].strftime('%d/%m/%Y')}"
+
+    return resultado
+
+def preencher_planilha(ws, linha, resultado):
+    for tipo, valor in resultado.items():
+        col = MAPEAMENTO_COLUNAS.get(tipo)
+        if col is None:
+            continue
+        celula = ws.cell(row=linha, column=col)
+        valor_atual = str(celula.value).strip().upper() if celula.value else ""
+
+        if valor_atual == "NÃO":
+            continue
+        if valor_atual == "*" and not valor:
+            continue
+        if valor_atual == "SUJEITO" and not valor:
+            continue
+        if valor:
+            celula.value = valor
+        elif tipo in ["ALVARÁ FUNCIONAMENTO", "ALVARÁ BOMBEIROS"] and valor_atual not in ["NÃO", "*"]:
+            celula.value = "Sujeito"
+
+# === SCRIPT PRINCIPAL ===
+if __name__ == "__main__":
+    wb, ws = carregar_planilha()
+    empresas = extrair_empresas(ws)
+
+    dados_finais = {}
+
+    for nome_empresa, municipio, linha in empresas:
+        nome_limpo = limpar_nome_empresa(nome_empresa)
+        caminho_base = os.path.join(CAMINHO_EMPRESAS, nome_limpo, "Societário", "Alvarás e Certidões")
+
+        if not os.path.exists(caminho_base):
+            continue
+
+        # verifica se existem subpastas por município
+        subpastas = [p for p in os.listdir(caminho_base) if os.path.isdir(os.path.join(caminho_base, p))]
+        caminho_alvo = caminho_base
+
+        if subpastas:
+            pasta_municipio = next((p for p in subpastas if municipio.lower() in p.lower()), None)
+            if pasta_municipio:
+                caminho_alvo = os.path.join(caminho_base, pasta_municipio)
+            else:
+                continue  # ignora se não encontrar subpasta do município
+
+        arquivos = buscar_arquivos_validos(caminho_alvo)
+        interpretacao = interpretar_documentos(arquivos)
+        dados_finais[f"{nome_empresa} ({municipio})"] = interpretacao
+        preencher_planilha(ws, linha, interpretacao)
+
+    wb.save(CAMINHO_PLANILHA)
+
+    with open(ARQUIVO_JSON_SAIDA, "w", encoding="utf-8") as f:
+        json.dump(dados_finais, f, ensure_ascii=False, indent=4)
+
+    print(f"\n✅ Planilha atualizada com sucesso.")
+    print(f"📄 Relatório salvo em: {ARQUIVO_JSON_SAIDA}")
